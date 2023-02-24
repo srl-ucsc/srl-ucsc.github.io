@@ -84,10 +84,17 @@
 	// Handle more info toggle
 	$(() => {
 		$('.more-info-toggle').each(function() {
-			$(this).click(() => {
-				let btn = $(this);
+			let btn = $(this);
+			let text = btn.text().trim();
+			if (text == '﹀' || text == '︿') {
+				text = ['﹀', '︿'];
+			}
+			else {
+				text = ['show more', 'show less'];
+			}
+			btn.click(() => {
 				btn.parent().toggleClass('closed');
-				btn.text(btn.text() == '﹀' ? '︿' : '﹀');
+				btn.text(btn.text().trim() == text[0] ? text[1] : text[0]);
 			});
 		});
 	});
