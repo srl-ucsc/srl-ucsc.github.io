@@ -378,6 +378,13 @@ section {
 	display: none;
 }
 
+.footnote {
+	font-size: 12px;
+	color: darkslategray;
+	font-style: italic;
+	line-height: 16px;
+	padding: 8px 10px 8px 10px;
+}
 
 
 /* Contact
