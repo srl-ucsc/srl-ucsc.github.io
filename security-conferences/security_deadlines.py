@@ -1,0 +1,1672 @@
+#!/usr/bin/env python3
+"""
+Security Conference Deadline Tracker
+
+Usage:
+    python3 security_deadlines.py            # Generate static HTML
+    python3 security_deadlines.py --serve    # Serve HTML + live update API on localhost:8765
+"""
+
+import json
+import re
+import sys
+import threading
+from datetime import datetime, timezone
+from functools import partial
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import URLError
+
+# All deadlines in AoE (UTC-12) unless noted otherwise.
+# Deadlines with is_submission=True are Abstract or Paper Submission deadlines
+# and are the only ones used for the "next deadline" badge and Active/Passed status.
+# Deadlines with a "tooltip" field show a hover popover with registration requirements.
+CONFERENCES = [
+    {
+        "name": "IEEE S&P 2026",
+        "full_name": "47th IEEE Symposium on Security and Privacy",
+        "venue": "San Francisco, CA, USA",
+        "conference_dates": "May 18\u201320, 2026",
+        "cfp_url": "https://sp2026.ieee-security.org/cfpapers.html",
+        "website": "https://sp2026.ieee-security.org/",
+        "color": "#1a73e8",
+        "cycles": [
+            {
+                "name": "Cycle 1",
+                "deadlines": [
+                    {
+                        "label": "Abstract Registration",
+                        "date": "2025-05-30T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "Finalized abstract text (frozen after deadline)",
+                            "Complete author list (no changes allowed after)",
+                            "ORCID for every author (must match submission system email)",
+                            "COI declarations on HotCRP: co-author, co-worker (2yr), institutional (2yr), research collaborator (2yr), funding collaborator (2yr), advisor/advisee (permanent), personal relationship",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2025-06-06T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject Notification", "date": "2025-07-21T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2025-08-18T00:00:00Z", "end": "2025-08-29T23:59:00Z"},
+                    {"label": "Acceptance Notification", "date": "2025-09-09T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2025-10-18T11:59:00Z"},
+                ],
+            },
+            {
+                "name": "Cycle 2",
+                "deadlines": [
+                    {
+                        "label": "Abstract Registration",
+                        "date": "2025-11-07T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "Finalized abstract text (frozen after deadline)",
+                            "Complete author list (no changes allowed after)",
+                            "ORCID for every author (must match submission system email)",
+                            "COI declarations on HotCRP: co-author, co-worker (2yr), institutional (2yr), research collaborator (2yr), funding collaborator (2yr), advisor/advisee (permanent), personal relationship",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2025-11-14T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject Notification", "date": "2026-01-19T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2026-02-12T00:00:00Z", "end": "2026-02-23T23:59:00Z"},
+                    {"label": "Acceptance Notification", "date": "2026-03-09T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-04-18T11:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "USENIX Security 2026",
+        "full_name": "35th USENIX Security Symposium",
+        "venue": "Baltimore, MD, USA",
+        "conference_dates": "August 12\u201314, 2026",
+        "cfp_url": "https://www.usenix.org/conference/usenixsecurity26/call-for-papers",
+        "website": "https://www.usenix.org/conference/usenixsecurity26",
+        "color": "#d32f2f",
+        "cycles": [
+            {
+                "name": "Cycle 1",
+                "deadlines": [
+                    {
+                        "label": "Abstract Registration",
+                        "date": "2025-08-20T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "All authors must be registered in the system",
+                            "Paper title (finalized)",
+                            "Non-blank abstract text",
+                            "Topic area selection",
+                            "Max 7 papers per author per cycle",
+                            "Research artifacts must be openly shared at submission time",
+                            "Mandatory appendices for ethics and open science",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2025-08-27T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject Notification", "date": "2025-10-07T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2025-11-06T00:00:00Z", "end": "2025-11-13T23:59:00Z"},
+                    {"label": "Author Notification", "date": "2025-12-04T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-01-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Cycle 2",
+                "deadlines": [
+                    {
+                        "label": "Abstract Registration",
+                        "date": "2026-01-30T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "All authors must be registered in the system",
+                            "Paper title (finalized)",
+                            "Non-blank abstract text",
+                            "Topic area selection",
+                            "Max 7 papers per author per cycle",
+                            "Research artifacts must be openly shared at submission time",
+                            "Mandatory appendices for ethics and open science",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-02-06T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject Notification", "date": "2026-03-17T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2026-04-16T00:00:00Z", "end": "2026-04-23T23:59:00Z"},
+                    {"label": "Author Notification", "date": "2026-05-14T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-06-11T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "ACM CCS 2026",
+        "full_name": "33rd ACM Conference on Computer and Communications Security",
+        "venue": "The Hague, The Netherlands",
+        "conference_dates": "November 15\u201319, 2026",
+        "cfp_url": "https://www.sigsac.org/ccs/CCS2026/call-for/call-for-papers.html",
+        "website": "https://www.sigsac.org/ccs/CCS2026/",
+        "color": "#388e3c",
+        "cycles": [
+            {
+                "name": "First Review Cycle",
+                "deadlines": [
+                    {
+                        "label": "Abstract Submission",
+                        "date": "2026-01-08T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "Abstract text (mandatory)",
+                            "Track selection \u2014 choose 1 of 10 tracks: Software Security, Web Security, Network Security, Usability & Measurement, ML Security & Privacy, Formal Methods & PL, Hardware & CPS, Applied Crypto, Blockchain & Distributed, Privacy & Anonymity",
+                            "Track justification statement (~200 words): why this track, alternatives considered",
+                            "ORCID required for camera-ready (obtain early)",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-01-15T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject Notification", "date": "2026-02-20T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2026-03-17T00:00:00Z", "end": "2026-03-20T23:59:00Z"},
+                    {"label": "Author Notification", "date": "2026-04-09T23:59:00Z"},
+                    {"label": "Minor Revision Approval", "date": "2026-06-05T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-08-21T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Second Review Cycle",
+                "deadlines": [
+                    {
+                        "label": "Abstract Submission",
+                        "date": "2026-04-23T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "Abstract text (mandatory)",
+                            "Track selection \u2014 choose 1 of 10 tracks: Software Security, Web Security, Network Security, Usability & Measurement, ML Security & Privacy, Formal Methods & PL, Hardware & CPS, Applied Crypto, Blockchain & Distributed, Privacy & Anonymity",
+                            "Track justification statement (~200 words): why this track, alternatives considered",
+                            "ORCID required for camera-ready (obtain early)",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-04-30T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject Notification", "date": "2026-06-03T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2026-06-29T00:00:00Z", "end": "2026-07-01T23:59:00Z"},
+                    {"label": "Author Notification", "date": "2026-07-17T23:59:00Z"},
+                    {"label": "Minor Revision Approval", "date": "2026-09-06T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-09-17T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "NDSS 2026",
+        "full_name": "Network and Distributed System Security Symposium",
+        "venue": "San Diego, CA, USA",
+        "conference_dates": "February 23\u201327, 2026",
+        "cfp_url": "https://www.ndss-symposium.org/ndss2026/submissions/call-for-papers/",
+        "website": "https://www.ndss-symposium.org/ndss2026/",
+        "color": "#7b1fa2",
+        "cycles": [
+            {
+                "name": "Summer Cycle",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-04-24T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject / Round 2", "date": "2025-05-28T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2025-06-18T00:00:00Z", "end": "2025-06-20T23:59:00Z"},
+                    {"label": "Author Notification", "date": "2025-07-02T23:59:00Z"},
+                    {"label": "Major Revision Due", "date": "2025-07-30T23:59:00Z"},
+                    {"label": "Major Revision Notification", "date": "2025-08-13T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2025-09-10T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Fall Cycle",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-08-07T11:59:00Z", "is_submission": True},
+                    {"label": "Early Reject / Round 2", "date": "2025-09-17T23:59:00Z"},
+                    {"label": "Rebuttal Period", "date": "2025-10-08T00:00:00Z", "end": "2025-10-10T23:59:00Z"},
+                    {"label": "Author Notification", "date": "2025-10-22T23:59:00Z"},
+                    {"label": "Major Revision Due", "date": "2025-11-19T23:59:00Z"},
+                    {"label": "Major Revision Notification", "date": "2025-12-03T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2025-12-17T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "USENIX OSDI 2026",
+        "full_name": "20th USENIX Symposium on Operating Systems Design and Implementation",
+        "venue": "Seattle, WA, USA",
+        "conference_dates": "July 13\u201315, 2026",
+        "cfp_url": "https://www.usenix.org/conference/osdi26/call-for-papers",
+        "website": "https://www.usenix.org/conference/osdi26",
+        "color": "#e65100",
+        "cycles": [
+            {
+                "name": "Single Cycle",
+                "deadlines": [
+                    {"label": "Abstract Registration", "date": "2025-12-04T22:59:00Z", "is_submission": True},
+                    {"label": "Paper Submission", "date": "2025-12-11T22:59:00Z", "is_submission": True},
+                    {"label": "Author Notification", "date": "2026-03-26T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-06-09T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "USENIX NSDI 2026",
+        "full_name": "23rd USENIX Symposium on Networked Systems Design and Implementation",
+        "venue": "Renton, WA, USA",
+        "conference_dates": "May 4\u20136, 2026",
+        "cfp_url": "https://www.usenix.org/conference/nsdi26/call-for-papers",
+        "website": "https://www.usenix.org/conference/nsdi26",
+        "color": "#00897b",
+        "cycles": [
+            {
+                "name": "Spring Cycle",
+                "deadlines": [
+                    {"label": "Abstract Registration", "date": "2025-04-19T06:59:00Z", "is_submission": True},
+                    {"label": "Paper Submission", "date": "2025-04-26T06:59:00Z", "is_submission": True},
+                    {"label": "Author Notification", "date": "2025-07-24T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2025-10-27T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Fall Cycle",
+                "deadlines": [
+                    {"label": "Abstract Registration", "date": "2025-09-12T06:59:00Z", "is_submission": True},
+                    {"label": "Paper Submission", "date": "2025-09-19T06:59:00Z", "is_submission": True},
+                    {"label": "Author Notification", "date": "2025-12-09T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-03-05T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "CRYPTO 2026",
+        "full_name": "IACR CRYPTO 2026",
+        "venue": "Santa Barbara, CA, USA",
+        "conference_dates": "August 17\u201320, 2026",
+        "cfp_url": "https://crypto.iacr.org/2026/callforpapers.php",
+        "website": "https://crypto.iacr.org/2026/",
+        "color": "#f57c00",
+        "cycles": [
+            {
+                "name": "Single Cycle",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2026-02-13T07:59:00Z", "is_submission": True},
+                    {"label": "First Round Notification", "date": "2026-04-07T23:59:00Z"},
+                    {"label": "Rebuttal Deadline", "date": "2026-04-13T23:59:00Z"},
+                    {"label": "Final Notification", "date": "2026-05-04T23:59:00Z"},
+                    {"label": "Camera Ready", "date": "2026-06-08T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "EUROCRYPT 2026",
+        "full_name": "IACR EUROCRYPT 2026",
+        "venue": "Rome, Italy",
+        "conference_dates": "May 10\u201314, 2026",
+        "cfp_url": "https://eurocrypt.iacr.org/2026/callforpapers.php",
+        "website": "https://eurocrypt.iacr.org/2026/",
+        "color": "#00796b",
+        "cycles": [
+            {
+                "name": "Single Cycle",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-10-03T11:59:00Z", "is_submission": True},
+                    {"label": "Rebuttal Period", "date": "2025-12-08T00:00:00Z", "end": "2025-12-12T23:59:00Z"},
+                    {"label": "Final Notification", "date": "2026-01-29T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "SIGMOD 2027",
+        "full_name": "ACM SIGMOD/PODS International Conference on Management of Data",
+        "venue": "Huntington Beach, CA, USA",
+        "conference_dates": "June 13\u201319, 2027",
+        "cfp_url": "https://2027.sigmod.org/calls_papers_sigmod_research.shtml",
+        "website": "https://2027.sigmod.org/",
+        "color": "#0288d1",
+        "cycles": [
+            {
+                "name": "Round 1",
+                "deadlines": [
+                    {
+                        "label": "Abstract & COI Registration",
+                        "date": "2026-01-11T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "CMT accounts required for ALL authors before submission",
+                            "ORCID required for every author (linked to CMT profile)",
+                            "Domain COI declarations on CMT (each author individually)",
+                            "Individual PC COI declarations on CMT: co-author, co-worker (5yr), collaborator (5yr), advisor/advisee (permanent), personal",
+                            "Finalized abstract text",
+                            "Incorrect/incomplete COI \u2192 immediate rejection",
+                            "Author list effectively frozen (all authors need accounts + COIs)",
+                            "Max 10 submissions per author across all 4 rounds",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-01-18T11:59:00Z", "is_submission": True},
+                    {"label": "Rebuttal", "date": "2026-03-10T00:00:00Z", "end": "2026-03-17T23:59:00Z"},
+                    {"label": "Initial Notification", "date": "2026-04-19T23:59:00Z"},
+                    {"label": "Revision Due", "date": "2026-05-19T23:59:00Z"},
+                    {"label": "Final Decision", "date": "2026-06-12T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Round 2",
+                "deadlines": [
+                    {
+                        "label": "Abstract & COI Registration",
+                        "date": "2026-04-11T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "CMT accounts required for ALL authors before submission",
+                            "ORCID required for every author (linked to CMT profile)",
+                            "Domain COI declarations on CMT (each author individually)",
+                            "Individual PC COI declarations on CMT: co-author, co-worker (5yr), collaborator (5yr), advisor/advisee (permanent), personal",
+                            "Finalized abstract text",
+                            "Incorrect/incomplete COI \u2192 immediate rejection",
+                            "Author list effectively frozen (all authors need accounts + COIs)",
+                            "Max 10 submissions per author across all 4 rounds",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-04-18T11:59:00Z", "is_submission": True},
+                    {"label": "Rebuttal", "date": "2026-06-10T00:00:00Z", "end": "2026-06-17T23:59:00Z"},
+                    {"label": "Initial Notification", "date": "2026-07-19T23:59:00Z"},
+                    {"label": "Revision Due", "date": "2026-08-19T23:59:00Z"},
+                    {"label": "Final Decision", "date": "2026-09-12T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Round 3",
+                "deadlines": [
+                    {
+                        "label": "Abstract & COI Registration",
+                        "date": "2026-07-11T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "CMT accounts required for ALL authors before submission",
+                            "ORCID required for every author (linked to CMT profile)",
+                            "Domain COI declarations on CMT (each author individually)",
+                            "Individual PC COI declarations on CMT: co-author, co-worker (5yr), collaborator (5yr), advisor/advisee (permanent), personal",
+                            "Finalized abstract text",
+                            "Incorrect/incomplete COI \u2192 immediate rejection",
+                            "Author list effectively frozen (all authors need accounts + COIs)",
+                            "Max 10 submissions per author across all 4 rounds",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-07-18T11:59:00Z", "is_submission": True},
+                    {"label": "Rebuttal", "date": "2026-09-10T00:00:00Z", "end": "2026-09-17T23:59:00Z"},
+                    {"label": "Initial Notification", "date": "2026-10-19T23:59:00Z"},
+                    {"label": "Revision Due", "date": "2026-11-19T23:59:00Z"},
+                    {"label": "Final Decision", "date": "2026-12-12T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Round 4",
+                "deadlines": [
+                    {
+                        "label": "Abstract & COI Registration",
+                        "date": "2026-10-11T11:59:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "CMT accounts required for ALL authors before submission",
+                            "ORCID required for every author (linked to CMT profile)",
+                            "Domain COI declarations on CMT (each author individually)",
+                            "Individual PC COI declarations on CMT: co-author, co-worker (5yr), collaborator (5yr), advisor/advisee (permanent), personal",
+                            "Finalized abstract text",
+                            "Incorrect/incomplete COI \u2192 immediate rejection",
+                            "Author list effectively frozen (all authors need accounts + COIs)",
+                            "Max 10 submissions per author across all 4 rounds",
+                        ],
+                    },
+                    {"label": "Paper Submission", "date": "2026-10-18T11:59:00Z", "is_submission": True},
+                    {"label": "Rebuttal", "date": "2026-12-10T00:00:00Z", "end": "2026-12-17T23:59:00Z"},
+                    {"label": "Initial Notification", "date": "2027-01-19T23:59:00Z"},
+                    {"label": "Revision Due", "date": "2027-02-19T23:59:00Z"},
+                    {"label": "Final Decision", "date": "2027-03-12T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+    {
+        "name": "VLDB 2026",
+        "full_name": "52nd International Conference on Very Large Data Bases",
+        "venue": "Boston, MA, USA",
+        "conference_dates": "August 31 \u2013 September 4, 2026",
+        "cfp_url": "https://www.vldb.org/2026/call-for-research-track.html",
+        "website": "https://www.vldb.org/2026/",
+        "color": "#6a1b9a",
+        "cycles": [
+            {
+                "name": "Monthly Round 1",
+                "deadlines": [
+                    {
+                        "label": "Paper Submission",
+                        "date": "2025-04-02T00:00:00Z",
+                        "is_submission": True,
+                        "tooltip": [
+                            "All authors registered in CMT",
+                            "COI declarations mandatory: institutional (2yr), co-authorship (3yr or 4+ papers in 10yr), collaboration (2yr), advisor/student (permanent), personal",
+                            "Undeclared or spurious COI \u2192 desk rejection",
+                            "Reviewer nomination: \u22651 author with 2+ prior SIGMOD/VLDB/ICDE papers",
+                            "Paper category tag in title if applicable: [Vision], [EA&B], or [Scalable Data Science]",
+                            "Concurrent related submissions must be declared and cited",
+                            "Supplementary materials via public archival repo (GitHub, Figshare, Dryad)",
+                            "Max 2 papers per author per month",
+                        ],
+                    },
+                    {"label": "Notification", "date": "2025-05-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 2",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-05-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-06-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 3",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-06-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-07-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 4",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-07-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-08-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 5",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-08-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-09-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 6",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-09-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-10-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 7",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-10-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-11-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 8",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-11-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2025-12-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 9",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2025-12-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2026-01-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 10",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2026-01-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2026-02-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 11",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2026-02-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2026-03-15T23:59:00Z"},
+                ],
+            },
+            {
+                "name": "Monthly Round 12 (Final)",
+                "deadlines": [
+                    {"label": "Paper Submission", "date": "2026-03-02T00:00:00Z", "is_submission": True},
+                    {"label": "Notification", "date": "2026-04-15T23:59:00Z"},
+                ],
+            },
+        ],
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Deadline verification via web scraping
+# ---------------------------------------------------------------------------
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+# Date patterns to look for when verifying a stored date against a page
+_MONTH = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May",
+           6: "June", 7: "July", 8: "August", 9: "September", 10: "October",
+           11: "November", 12: "December"}
+_MON = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+        7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+
+
+def _to_aoe(dt: datetime) -> datetime:
+    """Convert a UTC datetime to AoE (UTC-12) for display-date matching."""
+    from datetime import timedelta
+    return dt - timedelta(hours=12)
+
+
+def _date_patterns(dt: datetime) -> list[str]:
+    """Return multiple textual representations of a date for fuzzy matching.
+
+    Conference websites display dates in AoE (UTC-12), so we convert first.
+    """
+    aoe = _to_aoe(dt)
+    m, d, y = aoe.month, aoe.day, aoe.year
+    return [
+        f"{_MONTH[m]} {d}, {y}",       # June 5, 2025
+        f"{_MON[m]} {d}, {y}",          # Jun 5, 2025
+        f"{_MONTH[m]} {d:02d}, {y}",    # June 05, 2025
+        f"{d} {_MONTH[m]} {y}",         # 5 June 2025
+        f"{y}-{m:02d}-{d:02d}",         # 2025-06-05
+        f"{_MONTH[m]} {d}",             # June 5  (no year)
+        f"{_MON[m]} {d}",               # Jun 5
+    ]
+
+
+def verify_deadlines() -> list[dict]:
+    """Fetch each conference CFP page and check stored dates against it."""
+    report = []
+    for conf in CONFERENCES:
+        url = conf["cfp_url"]
+        try:
+            req = Request(url, headers={"User-Agent": UA})
+            resp = urlopen(req, timeout=15)
+            page = resp.read().decode("utf-8", errors="ignore")
+
+            verified, unverified = 0, 0
+            for cycle in conf["cycles"]:
+                for dl in cycle["deadlines"]:
+                    if not dl.get("is_submission"):
+                        continue
+                    dt = datetime.fromisoformat(dl["date"].replace("Z", "+00:00"))
+                    if any(p in page for p in _date_patterns(dt)):
+                        verified += 1
+                    else:
+                        unverified += 1
+
+            total = verified + unverified
+            report.append({
+                "name": conf["name"],
+                "status": "verified" if unverified == 0 else "partial",
+                "verified": verified,
+                "unverified": unverified,
+                "total": total,
+            })
+        except Exception as e:
+            report.append({
+                "name": conf["name"],
+                "status": "error",
+                "error": str(e)[:120],
+                "verified": 0,
+                "unverified": 0,
+                "total": 0,
+            })
+    return report
+
+
+# ---------------------------------------------------------------------------
+# HTML generation
+# ---------------------------------------------------------------------------
+def generate_html(conferences: list[dict]) -> str:
+    conf_json = json.dumps(conferences, indent=2)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conference Deadlines</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface-hover: #22263a;
+    --border: #2a2e3f;
+    --text: #e4e6f0;
+    --text-muted: #8b8fa3;
+    --text-dim: #5d6177;
+    --accent: #6c72ff;
+    --accent-glow: rgba(108, 114, 255, 0.15);
+    --past: #3a3d4a;
+    --past-text: #6b6e80;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --red: #f87171;
+  }}
+
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
+  body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.5;
+  }}
+
+  /* ---- Hero ---- */
+  .hero {{
+    text-align: center;
+    padding: 60px 20px 40px;
+    background: linear-gradient(180deg, rgba(108,114,255,0.08) 0%, transparent 100%);
+    position: relative;
+  }}
+  .hero h1 {{
+    font-size: 2.5rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    background: linear-gradient(135deg, #6c72ff, #a78bfa, #6c72ff);
+    background-size: 200% 200%;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shimmer 6s ease-in-out infinite;
+  }}
+  @keyframes shimmer {{
+    0%, 100% {{ background-position: 0% 50%; }}
+    50% {{ background-position: 100% 50%; }}
+  }}
+  .hero p {{
+    color: var(--text-muted);
+    margin-top: 10px;
+    font-size: 1.05rem;
+    font-weight: 300;
+  }}
+  .hero .update-time {{
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    margin-top: 8px;
+  }}
+
+  /* ---- Refresh button (top-right) ---- */
+  .refresh-btn {{
+    position: absolute;
+    top: 24px;
+    right: 24px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+  }}
+  .refresh-btn:hover {{ background: var(--surface-hover); color: var(--text); border-color: var(--accent); }}
+  .refresh-btn.loading {{ pointer-events: none; opacity: 0.6; }}
+  .refresh-btn svg {{ width: 15px; height: 15px; }}
+  .refresh-btn.loading svg {{ animation: spin 1s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+  /* ---- Verification modal ---- */
+  .modal-overlay {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 500;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px);
+    align-items: center;
+    justify-content: center;
+  }}
+  .modal-overlay.open {{ display: flex; }}
+  .modal {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px 32px;
+    width: 480px;
+    max-width: 92vw;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }}
+  .modal h3 {{
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 16px;
+    color: var(--text);
+  }}
+  .modal-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(42,46,63,0.5);
+    font-size: 0.88rem;
+  }}
+  .modal-row:last-child {{ border-bottom: none; }}
+  .modal-status {{
+    font-weight: 600;
+    font-size: 0.8rem;
+    padding: 3px 10px;
+    border-radius: 6px;
+  }}
+  .modal-status.verified {{ background: rgba(52,211,153,0.15); color: var(--green); }}
+  .modal-status.partial  {{ background: rgba(251,191,36,0.15); color: var(--amber); }}
+  .modal-status.error    {{ background: rgba(248,113,113,0.15); color: var(--red); }}
+  .modal-close {{
+    margin-top: 18px;
+    width: 100%;
+    padding: 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-hover);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.88rem;
+    cursor: pointer;
+    transition: background 0.2s;
+  }}
+  .modal-close:hover {{ background: var(--accent-glow); }}
+  .modal-hint {{
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    margin-top: 12px;
+    line-height: 1.5;
+  }}
+  .modal-hint code {{
+    background: rgba(108,114,255,0.12);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.76rem;
+    color: var(--accent);
+  }}
+
+  /* ---- Filter bar ---- */
+  .filter-bar {{
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 0 20px 30px;
+    max-width: 1000px;
+    margin: 0 auto;
+  }}
+  .filter-btn {{
+    padding: 6px 16px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.2s;
+  }}
+  .filter-btn:hover {{ background: var(--surface-hover); color: var(--text); }}
+  .filter-btn.active {{
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }}
+
+  /* ---- Container ---- */
+  .container {{
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 0 20px 60px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }}
+
+  /* ---- Conference card ---- */
+  .conf-card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }}
+  .conf-card:hover {{
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+  }}
+  .conf-header {{
+    padding: 24px 28px 18px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+  }}
+  .conf-title-area {{
+    flex: 1;
+    min-width: 250px;
+  }}
+  .conf-name {{
+    font-size: 1.45rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }}
+  .conf-name .color-dot {{
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }}
+  .conf-meta {{
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    margin-top: 4px;
+    font-weight: 400;
+  }}
+  .conf-badge {{
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }}
+  .cfp-link {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 14px;
+    border-radius: 8px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.82rem;
+    font-weight: 500;
+    transition: background 0.2s;
+    white-space: nowrap;
+  }}
+  .cfp-link:hover {{ background: rgba(108,114,255,0.25); }}
+  .cfp-link svg {{ width: 14px; height: 14px; }}
+
+  /* ---- Status badges ---- */
+  .status-badge {{
+    padding: 4px 12px;
+    border-radius: 8px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }}
+  .status-badge.active   {{ background: rgba(52,211,153,0.15); color: var(--green); }}
+  .status-badge.passed   {{ background: rgba(91,95,117,0.15); color: var(--past-text); }}
+
+  .next-deadline-badge {{
+    padding: 5px 12px;
+    border-radius: 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }}
+  .next-deadline-badge.urgent   {{ background: rgba(248,113,113,0.15); color: var(--red); }}
+  .next-deadline-badge.soon     {{ background: rgba(251,191,36,0.15); color: var(--amber); }}
+  .next-deadline-badge.upcoming {{ background: rgba(52,211,153,0.15); color: var(--green); }}
+  .next-deadline-badge.past     {{ background: rgba(91,95,117,0.15); color: var(--past-text); }}
+
+  /* ---- Cycle sections ---- */
+  .cycle-section {{ border-top: 1px solid var(--border); }}
+  .cycle-header {{
+    padding: 12px 28px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    user-select: none;
+    transition: color 0.2s;
+  }}
+  .cycle-header:hover {{ color: var(--text-muted); }}
+  .cycle-header .chevron {{
+    transition: transform 0.2s;
+    font-size: 0.7rem;
+  }}
+  .cycle-header .chevron.open {{ transform: rotate(90deg); }}
+
+  .deadline-grid {{
+    display: grid;
+    gap: 0;
+    overflow: hidden;
+    transition: max-height 0.35s ease, opacity 0.25s ease;
+  }}
+  .deadline-grid.collapsed {{
+    max-height: 0 !important;
+    opacity: 0;
+  }}
+
+  /* ---- Deadline rows ---- */
+  .deadline-row {{
+    display: grid;
+    grid-template-columns: 1fr 170px 1fr;
+    align-items: center;
+    padding: 10px 28px;
+    border-top: 1px solid rgba(42,46,63,0.5);
+    font-size: 0.88rem;
+    transition: background 0.15s;
+  }}
+  .deadline-row:hover {{ background: var(--surface-hover); }}
+
+  /* Past rows: dim children individually so tooltip stays readable */
+  .deadline-row.past > .deadline-label {{ color: var(--past-text); }}
+  .deadline-row.past > .deadline-date  {{ color: var(--past-text); }}
+  .deadline-row.past .status-dot {{ background: var(--past) !important; box-shadow: none !important; }}
+  .deadline-row.past .has-tooltip {{ border-bottom-color: var(--past-text); }}
+
+  .deadline-label {{
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: relative;
+  }}
+  .deadline-label .status-dot {{
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }}
+  .status-dot.past-dot     {{ background: var(--past); }}
+  .status-dot.urgent-dot   {{ background: var(--red); box-shadow: 0 0 6px var(--red); }}
+  .status-dot.soon-dot     {{ background: var(--amber); box-shadow: 0 0 6px var(--amber); }}
+  .status-dot.upcoming-dot {{ background: var(--green); }}
+
+  .deadline-date {{
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    font-weight: 400;
+  }}
+  .deadline-countdown {{
+    text-align: right;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+  }}
+  .countdown-past     {{ color: var(--past-text); }}
+  .countdown-urgent   {{ color: var(--red); }}
+  .countdown-soon     {{ color: var(--amber); }}
+  .countdown-upcoming {{ color: var(--green); }}
+
+  /* ---- Tooltip ---- */
+  .has-tooltip {{
+    cursor: help;
+    border-bottom: 1px dashed var(--text-muted);
+    padding-bottom: 1px;
+  }}
+  .tooltip-wrap {{
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }}
+  .tooltip-icon {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--accent-glow);
+    color: var(--accent);
+    font-size: 0.65rem;
+    font-weight: 700;
+    flex-shrink: 0;
+    cursor: help;
+  }}
+  .tooltip-popover {{
+    display: none;
+    position: absolute;
+    left: 0;
+    top: calc(100% + 8px);
+    z-index: 100;
+    width: 380px;
+    max-width: 90vw;
+    background: #1e2235;
+    border: 1px solid #3a3f5c;
+    border-radius: 12px;
+    padding: 16px 18px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    pointer-events: none;
+  }}
+  .tooltip-wrap:hover .tooltip-popover {{ display: block; }}
+  .tooltip-popover h4 {{
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent);
+    margin-bottom: 10px;
+  }}
+  .tooltip-popover ul {{ list-style: none; padding: 0; }}
+  .tooltip-popover li {{
+    position: relative;
+    padding: 4px 0 4px 16px;
+    font-size: 0.8rem;
+    color: var(--text);
+    line-height: 1.45;
+  }}
+  .tooltip-popover li::before {{
+    content: '';
+    position: absolute;
+    left: 0; top: 11px;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.6;
+  }}
+  .tooltip-popover li + li {{
+    border-top: 1px solid rgba(42,46,63,0.5);
+  }}
+
+  /* ---- All Conferences list view ---- */
+  .conf-list-item {{
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }}
+  .conf-list-item:hover {{
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  }}
+  .conf-list-dot {{
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }}
+  .conf-list-info {{
+    flex: 1;
+    min-width: 0;
+  }}
+  .conf-list-name {{
+    font-size: 1.05rem;
+    font-weight: 600;
+  }}
+  .conf-list-name a {{
+    color: var(--text);
+    text-decoration: none;
+    transition: color 0.15s;
+  }}
+  .conf-list-name a:hover {{ color: var(--accent); }}
+  .conf-list-detail {{
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }}
+  .conf-list-links {{
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }}
+
+  /* ---- Verification badge ---- */
+  .verify-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 8px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: default;
+  }}
+  .verify-badge.verified {{
+    background: rgba(52,211,153,0.12);
+    color: var(--green);
+  }}
+  .verify-badge.partial {{
+    background: rgba(251,191,36,0.12);
+    color: var(--amber);
+  }}
+  .verify-badge.error {{
+    background: rgba(248,113,113,0.12);
+    color: var(--red);
+  }}
+  .verify-badge.pending {{
+    background: rgba(91,95,117,0.12);
+    color: var(--text-dim);
+  }}
+  .verify-badge svg {{
+    width: 13px;
+    height: 13px;
+    flex-shrink: 0;
+  }}
+  .verify-timestamp {{
+    font-weight: 400;
+    opacity: 0.8;
+  }}
+
+  /* ---- Auto-verify timer display ---- */
+  .auto-verify-info {{
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    margin-top: 4px;
+  }}
+
+  /* ---- Responsive ---- */
+  @media (max-width: 640px) {{
+    .hero h1 {{ font-size: 1.7rem; }}
+    .refresh-btn {{ top: 14px; right: 14px; padding: 6px 12px; font-size: 0.75rem; }}
+    .conf-header {{ padding: 18px 18px 14px; }}
+    .cycle-header {{ padding: 10px 18px; }}
+    .deadline-row {{
+      grid-template-columns: 1fr;
+      gap: 2px;
+      padding: 10px 18px;
+    }}
+    .deadline-date {{ text-align: left; }}
+    .deadline-countdown {{ text-align: left; }}
+    .tooltip-popover {{ width: 280px; }}
+    .conf-list-item {{ flex-wrap: wrap; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Conference Deadlines</h1>
+  <p>Top-tier security, cryptography &amp; data management conferences \u2014 live countdown</p>
+  <div class="update-time">Last generated: <span id="gen-time"></span></div>
+  <button class="refresh-btn" id="refresh-btn" title="Verify deadlines against conference websites">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="23 4 23 10 17 10"></polyline>
+      <polyline points="1 20 1 14 7 14"></polyline>
+      <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"></path>
+    </svg>
+    <span>Verify</span>
+  </button>
+</div>
+
+<!-- Verification modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h3 id="modal-title">Verifying deadlines...</h3>
+    <div id="modal-body"></div>
+    <button class="modal-close" id="modal-close">Close</button>
+  </div>
+</div>
+
+<div class="filter-bar" id="filter-bar">
+  <button class="filter-btn active" data-filter="upcoming">Upcoming</button>
+  <button class="filter-btn" data-filter="all">All Conferences</button>
+</div>
+
+<div class="container" id="container"></div>
+
+<script>
+const CONFERENCES = {conf_json};
+
+const NOW = new Date();
+
+document.getElementById('gen-time').textContent = NOW.toLocaleDateString('en-US', {{
+  year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'
+}});
+
+// ---- Verification state per conference ----
+// Persist verification results in localStorage so badges survive page reloads
+const STORAGE_KEY = 'conf_verify_state';
+let verificationState = {{}};
+try {{ const saved = localStorage.getItem(STORAGE_KEY); if (saved) verificationState = JSON.parse(saved); }} catch(_) {{}}
+
+function saveVerificationState() {{
+  try {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(verificationState)); }} catch(_) {{}}
+}}
+
+const checkIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>`;
+const warnIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
+const errorIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
+const pendingIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
+
+function formatVerifyTime(ts) {{
+  const d = new Date(ts);
+  return d.toLocaleTimeString('en-US', {{ hour: '2-digit', minute: '2-digit' }}) + ', ' +
+         d.toLocaleDateString('en-US', {{ month: 'short', day: 'numeric' }});
+}}
+
+function getVerifyBadgeHtml(confName) {{
+  const v = verificationState[confName];
+  if (!v) return `<span class="verify-badge pending">${{pendingIcon}} Not verified</span>`;
+  const ts = `<span class="verify-timestamp">${{formatVerifyTime(v.timestamp)}}</span>`;
+  if (v.status === 'verified') return `<span class="verify-badge verified" title="All ${{v.total}} submission deadlines verified against CFP page">${{checkIcon}} Verified ${{ts}}</span>`;
+  if (v.status === 'partial') return `<span class="verify-badge partial" title="${{v.verified}}/${{v.total}} submission deadlines matched CFP page">${{warnIcon}} ${{v.verified}}/${{v.total}} ${{ts}}</span>`;
+  return `<span class="verify-badge error" title="Could not fetch CFP page: ${{v.error || 'unknown'}}">${{errorIcon}} Error ${{ts}}</span>`;
+}}
+
+// ---- Client-side date matching (mirrors Python _date_patterns) ----
+const MONTHS = ['','January','February','March','April','May','June','July','August','September','October','November','December'];
+const MON    = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function toAoE(dt) {{
+  // AoE = UTC-12: subtract 12 hours
+  return new Date(dt.getTime() - 12 * 3600000);
+}}
+
+function datePatterns(isoStr) {{
+  const dt = toAoE(new Date(isoStr));
+  const m = dt.getUTCMonth() + 1, d = dt.getUTCDate(), y = dt.getUTCFullYear();
+  const pad = (n) => String(n).padStart(2, '0');
+  return [
+    `${{MONTHS[m]}} ${{d}}, ${{y}}`,       // June 5, 2025
+    `${{MON[m]}} ${{d}}, ${{y}}`,           // Jun 5, 2025
+    `${{MONTHS[m]}} ${{pad(d)}}, ${{y}}`,   // June 05, 2025
+    `${{d}} ${{MONTHS[m]}} ${{y}}`,         // 5 June 2025
+    `${{y}}-${{pad(m)}}-${{pad(d)}}`,       // 2025-06-05
+    `${{MONTHS[m]}} ${{d}}`,               // June 5
+    `${{MON[m]}} ${{d}}`,                  // Jun 5
+  ];
+}}
+
+// ---- CORS proxy fetch with fallbacks ----
+const CORS_PROXIES = [
+  url => `https://api.allorigins.win/raw?url=${{encodeURIComponent(url)}}`,
+  url => `https://corsproxy.io/?${{encodeURIComponent(url)}}`,
+];
+
+async function fetchViaProxy(url) {{
+  for (const makeUrl of CORS_PROXIES) {{
+    try {{
+      const resp = await fetch(makeUrl(url), {{ signal: AbortSignal.timeout(20000) }});
+      if (resp.ok) return await resp.text();
+    }} catch(_) {{}}
+  }}
+  throw new Error('All CORS proxies failed');
+}}
+
+// ---- Verify a single conference ----
+async function verifyOneConference(conf) {{
+  try {{
+    const page = await fetchViaProxy(conf.cfp_url);
+    let verified = 0, unverified = 0;
+    for (const cycle of conf.cycles) {{
+      for (const dl of cycle.deadlines) {{
+        if (!dl.is_submission) continue;
+        const patterns = datePatterns(dl.date);
+        if (patterns.some(p => page.includes(p))) verified++;
+        else unverified++;
+      }}
+    }}
+    const total = verified + unverified;
+    return {{
+      name: conf.name,
+      status: unverified === 0 ? 'verified' : 'partial',
+      verified, unverified, total,
+    }};
+  }} catch (e) {{
+    return {{
+      name: conf.name,
+      status: 'error',
+      error: String(e).slice(0, 120),
+      verified: 0, unverified: 0, total: 0,
+    }};
+  }}
+}}
+
+// ---- Run full verification (client-side) ----
+const AUTO_VERIFY_INTERVAL = 14 * 24 * 60 * 60 * 1000;  // 2 weeks
+let autoVerifyTimer = null;
+
+async function runVerification({{ showModal = true }} = {{}}) {{
+  const refreshBtn = document.getElementById('refresh-btn');
+  const modalOverlay = document.getElementById('modal-overlay');
+  const modalTitle  = document.getElementById('modal-title');
+  const modalBody   = document.getElementById('modal-body');
+
+  if (showModal) {{
+    refreshBtn.classList.add('loading');
+    refreshBtn.querySelector('span').textContent = 'Verifying...';
+    modalTitle.textContent = 'Verifying deadlines...';
+    modalBody.innerHTML = '<div style="color:var(--text-muted);font-size:0.88rem;padding:12px 0;">Fetching conference CFP pages and checking dates... This may take a moment.</div>';
+    modalOverlay.classList.add('open');
+  }}
+
+  // Verify all conferences in parallel
+  const results = await Promise.all(CONFERENCES.map(c => verifyOneConference(c)));
+
+  // Store results
+  const ts = Date.now();
+  for (const r of results) {{
+    verificationState[r.name] = {{ ...r, timestamp: ts }};
+  }}
+  saveVerificationState();
+  render();
+
+  if (showModal) {{
+    modalTitle.textContent = 'Verification Results';
+    let html = '';
+    for (const r of results) {{
+      let badge = '';
+      if (r.status === 'verified') badge = `<span class="modal-status verified">All verified (${{r.verified}}/${{r.total}})</span>`;
+      else if (r.status === 'partial') badge = `<span class="modal-status partial">${{r.verified}}/${{r.total}} verified</span>`;
+      else badge = `<span class="modal-status error" title="${{r.error || ''}}">Fetch error</span>`;
+      html += `<div class="modal-row"><span>${{r.name}}</span>${{badge}}</div>`;
+    }}
+    html += `<div style="color:var(--text-dim);font-size:0.75rem;margin-top:12px;">Results saved locally. Auto-verification runs every 2 weeks.</div>`;
+    modalBody.innerHTML = html;
+    refreshBtn.classList.remove('loading');
+    refreshBtn.querySelector('span').textContent = 'Verify';
+  }}
+
+  // Start periodic timer
+  if (!autoVerifyTimer) {{
+    autoVerifyTimer = setInterval(() => {{
+      runVerification({{ showModal: false }});
+    }}, AUTO_VERIFY_INTERVAL);
+  }}
+}}
+
+
+function parseDate(s) {{ return new Date(s); }}
+
+function formatDate(d) {{
+  return d.toLocaleDateString('en-US', {{ month: 'short', day: 'numeric', year: 'numeric' }});
+}}
+
+function formatDateRange(start, end) {{
+  return formatDate(parseDate(start)) + ' \u2013 ' + formatDate(parseDate(end));
+}}
+
+function timeDiff(target) {{
+  const diff = target - NOW;
+  if (diff <= 0) return null;
+  const days = Math.floor(diff / 86400000);
+  const hours = Math.floor((diff % 86400000) / 3600000);
+  const mins = Math.floor((diff % 3600000) / 60000);
+  return {{ days, hours, mins, total: diff }};
+}}
+
+function countdownText(target) {{
+  const d = timeDiff(target);
+  if (!d) return {{ text: 'Passed', cls: 'past' }};
+  if (d.days === 0) return {{ text: d.hours + 'h ' + d.mins + 'm', cls: 'urgent' }};
+  if (d.days < 7) return {{ text: d.days + 'd ' + d.hours + 'h', cls: 'urgent' }};
+  if (d.days < 30) return {{ text: d.days + ' days', cls: 'soon' }};
+  return {{ text: d.days + ' days', cls: 'upcoming' }};
+}}
+
+function getNextSubmissionDeadline(conf) {{
+  let earliest = null;
+  for (const cycle of conf.cycles) {{
+    for (const dl of cycle.deadlines) {{
+      if (!dl.is_submission) continue;
+      const t = parseDate(dl.date);
+      if (t > NOW && (!earliest || t < earliest)) earliest = t;
+    }}
+  }}
+  return earliest;
+}}
+
+function isActive(conf) {{
+  return getNextSubmissionDeadline(conf) !== null;
+}}
+
+function escapeHtml(s) {{
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+
+function buildTooltipHtml(tooltip) {{
+  if (!tooltip || !tooltip.length) return '';
+  const items = tooltip.map(t => `<li>${{escapeHtml(t)}}</li>`).join('');
+  return `<span class="tooltip-icon">i</span><div class="tooltip-popover"><h4>Registration Requirements</h4><ul>${{items}}</ul></div>`;
+}}
+
+const linkIcon = `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z"/><path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z"/></svg>`;
+
+let currentFilter = 'upcoming';
+
+function renderUpcoming() {{
+  const container = document.getElementById('container');
+  container.innerHTML = '';
+
+  const sorted = [...CONFERENCES].sort((a, b) => {{
+    const na = getNextSubmissionDeadline(a);
+    const nb = getNextSubmissionDeadline(b);
+    if (!na && !nb) return 0;
+    if (!na) return 1;
+    if (!nb) return -1;
+    return na - nb;
+  }});
+
+  for (const conf of sorted) {{
+    if (!isActive(conf)) continue;
+
+    const card = document.createElement('div');
+    card.className = 'conf-card';
+
+    const nextDl = getNextSubmissionDeadline(conf);
+    const cd = countdownText(nextDl);
+    const statusHtml = `<span class="status-badge active">Active</span>`;
+    const countdownHtml = `<span class="next-deadline-badge ${{cd.cls}}">Next submission: ${{cd.text}}</span>`;
+
+    card.innerHTML = `
+      <div class="conf-header">
+        <div class="conf-title-area">
+          <div class="conf-name">
+            <span class="color-dot" style="background:${{conf.color}}"></span>
+            ${{conf.name}}
+          </div>
+          <div class="conf-meta">${{conf.full_name}} &middot; ${{conf.venue}} &middot; ${{conf.conference_dates}}</div>
+        </div>
+        <div class="conf-badge">
+          ${{getVerifyBadgeHtml(conf.name)}}
+          ${{statusHtml}}
+          ${{countdownHtml}}
+          <a class="cfp-link" href="${{conf.cfp_url}}" target="_blank" rel="noopener">${{linkIcon}} CFP</a>
+        </div>
+      </div>
+    `;
+
+    for (let ci = 0; ci < conf.cycles.length; ci++) {{
+      const cycle = conf.cycles[ci];
+      const section = document.createElement('div');
+      section.className = 'cycle-section';
+
+      const cycleHasActiveSubmission = cycle.deadlines.some(dl => dl.is_submission && parseDate(dl.date) > NOW);
+      const startOpen = cycleHasActiveSubmission;
+
+      section.innerHTML = `
+        <div class="cycle-header" data-toggle="${{conf.name}}-${{ci}}">
+          <span class="chevron ${{startOpen ? 'open' : ''}}">&#9654;</span>
+          ${{cycle.name}}
+        </div>
+        <div class="deadline-grid ${{startOpen ? '' : 'collapsed'}}" id="grid-${{conf.name}}-${{ci}}" style="max-height:${{startOpen ? '2000px' : '0'}}">
+          ${{cycle.deadlines.map(dl => {{
+            const dt = parseDate(dl.date);
+            const cd = countdownText(dt);
+            const isPast = dt <= NOW;
+            const dateStr = dl.end ? formatDateRange(dl.date, dl.end) : formatDate(dt);
+            const tooltipHtml = dl.tooltip ? buildTooltipHtml(dl.tooltip) : '';
+            const labelClass = dl.tooltip ? 'has-tooltip' : '';
+            return `
+              <div class="deadline-row ${{isPast ? 'past' : ''}}">
+                <div class="deadline-label">
+                  <span class="status-dot ${{cd.cls}}-dot"></span>
+                  <span class="tooltip-wrap">
+                    <span class="${{labelClass}}">${{dl.label}}</span>
+                    ${{tooltipHtml}}
+                  </span>
+                </div>
+                <div class="deadline-date">${{dateStr}}</div>
+                <div class="deadline-countdown countdown-${{cd.cls}}">${{cd.text}}</div>
+              </div>`;
+          }}).join('')}}
+        </div>
+      `;
+      card.appendChild(section);
+    }}
+
+    container.appendChild(card);
+  }}
+
+  attachToggleListeners();
+}}
+
+function renderAllConferences() {{
+  const container = document.getElementById('container');
+  container.innerHTML = '';
+
+  const sorted = [...CONFERENCES].sort((a, b) => {{
+    const aa = isActive(a), ab = isActive(b);
+    if (aa && !ab) return -1;
+    if (!aa && ab) return 1;
+    return a.name.localeCompare(b.name);
+  }});
+
+  for (const conf of sorted) {{
+    const active = isActive(conf);
+    const item = document.createElement('div');
+    item.className = 'conf-list-item';
+    item.innerHTML = `
+      <span class="conf-list-dot" style="background:${{conf.color}}"></span>
+      <div class="conf-list-info">
+        <div class="conf-list-name"><a href="${{conf.website || conf.cfp_url}}" target="_blank" rel="noopener">${{conf.name}}</a></div>
+        <div class="conf-list-detail">${{conf.full_name}} &middot; ${{conf.venue}} &middot; ${{conf.conference_dates}}</div>
+      </div>
+      <div class="conf-list-links">
+        ${{getVerifyBadgeHtml(conf.name)}}
+        <span class="status-badge ${{active ? 'active' : 'passed'}}">${{active ? 'Active' : 'Passed'}}</span>
+        <a class="cfp-link" href="${{conf.cfp_url}}" target="_blank" rel="noopener">${{linkIcon}} CFP</a>
+        <a class="cfp-link" href="${{conf.website || conf.cfp_url}}" target="_blank" rel="noopener">${{linkIcon}} Site</a>
+      </div>
+    `;
+    container.appendChild(item);
+  }}
+}}
+
+function attachToggleListeners() {{
+  document.querySelectorAll('.cycle-header').forEach(header => {{
+    header.addEventListener('click', () => {{
+      const id = header.dataset.toggle;
+      const grid = document.getElementById('grid-' + id);
+      const chevron = header.querySelector('.chevron');
+      grid.classList.toggle('collapsed');
+      chevron.classList.toggle('open');
+      if (!grid.classList.contains('collapsed')) {{
+        grid.style.maxHeight = grid.scrollHeight + 'px';
+      }}
+    }});
+  }});
+}}
+
+function render() {{
+  if (currentFilter === 'upcoming') renderUpcoming();
+  else renderAllConferences();
+}}
+
+// Filter buttons
+document.getElementById('filter-bar').addEventListener('click', (e) => {{
+  if (!e.target.classList.contains('filter-btn')) return;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  currentFilter = e.target.dataset.filter;
+  render();
+}});
+
+// ---- Refresh / Verify button ----
+const refreshBtn = document.getElementById('refresh-btn');
+const modalOverlay = document.getElementById('modal-overlay');
+const modalTitle = document.getElementById('modal-title');
+const modalBody = document.getElementById('modal-body');
+const modalClose = document.getElementById('modal-close');
+
+modalClose.addEventListener('click', () => {{ modalOverlay.classList.remove('open'); }});
+modalOverlay.addEventListener('click', (e) => {{ if (e.target === modalOverlay) modalOverlay.classList.remove('open'); }});
+
+document.getElementById('refresh-btn').addEventListener('click', () => {{ runVerification({{ showModal: true }}); }});
+
+render();
+setInterval(() => {{ render(); }}, 60000);
+
+// Auto-verify on load if cached results are stale (older than 2 weeks) or missing
+(function() {{
+  const timestamps = Object.values(verificationState).map(v => v.timestamp || 0);
+  const oldest = timestamps.length ? Math.min(...timestamps) : 0;
+  if (Date.now() - oldest > AUTO_VERIFY_INTERVAL) {{
+    setTimeout(() => {{ runVerification({{ showModal: false }}); }}, 2000);
+  }}
+}})();
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Local HTTP server for live verification
+# ---------------------------------------------------------------------------
+class DeadlineHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, directory=None, **kwargs):
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self.path = "/security_deadlines.html"
+        super().do_GET()
+
+    def do_POST(self):
+        if self.path == "/api/verify":
+            report = verify_deadlines()
+            body = json.dumps(report).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        # Quieter logging
+        msg = fmt % args
+        if "POST /api/verify" in msg or "GET / " in msg:
+            print(f"  {msg}")
+
+
+def main():
+    out_dir = Path(__file__).parent
+    out_path = out_dir / "security_deadlines.html"
+    html = generate_html(CONFERENCES)
+    out_path.write_text(html, encoding="utf-8")
+
+    # Also write to the public site route (conf-ddls/index.html)
+    site_path = out_dir.parent / "conf-ddls" / "index.html"
+    site_path.parent.mkdir(parents=True, exist_ok=True)
+    site_path.write_text(html, encoding="utf-8")
+
+    if "--serve" in sys.argv:
+        port = 8765
+        handler = partial(DeadlineHandler, directory=str(out_dir))
+        server = HTTPServer(("localhost", port), handler)
+        print(f"Serving at http://localhost:{port}")
+        print(f"Press Ctrl+C to stop.\n")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    else:
+        print(f"Generated: {out_path.resolve()}")
+        print(f"Open in browser: file://{out_path.resolve()}")
+        print(f"\nFor live verification, run:  python3 {Path(__file__).name} --serve")
+
+
+if __name__ == "__main__":
+    main()
